@@ -24,11 +24,12 @@ from typing import Any, AsyncGenerator, Callable, Coroutine
 from urllib.parse import quote
 import urllib.parse
 from uuid import uuid4
+from pathlib import Path
 
 import httpx
 import anyio
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse, FileResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse, FileResponse, HTMLResponse
 
 try:
     from . import recommend as dailyrec
@@ -75,7 +76,7 @@ CONF = {
     "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "false").lower() in ("true", "1", "yes"),
     "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "true").lower() in ("true", "1", "yes"),
     "lx_search_limit": int(os.environ.get("FNMUSIC_LX_SEARCH_LIMIT", "20")),
-    "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "lossless"),
+    "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "320k"),
     "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "3.0")),
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
     "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "50")),
@@ -583,7 +584,7 @@ def build_online_track(item: dict) -> dict:
     except (TypeError, ValueError):
         duration_s = 0
     duration_ms = int(duration_s * 1000)
-    ext = str(item.get("ext") or "flac") or "flac"
+    ext = "mp3"  # 统一有损 mp3，兼容飞牛 WebView/客户端解码
     play_format = play_format_from_ext(ext)
     file_size = item.get("file_size") or 0
     try:
@@ -621,6 +622,7 @@ def build_online_track(item: dict) -> dict:
     return {
         "guid": guid,
         "id": guid,
+        "trackId": guid,
         "title": title,
         "name": title,
         "artist": artist,
@@ -1062,6 +1064,27 @@ def media_type_for_ext(ext: str) -> str:
     }.get(ext.lower(), "application/octet-stream")
 
 
+def _ext_from_magic(head: bytes) -> str | None:
+    """用真实字节头判定格式，覆盖自定义音源谎报的 format（如返回 MP3 字节却声明 flac）。"""
+    if not head:
+        return None
+    if head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+        return "mp3"
+    if head[:4] == b"fLaC":
+        return "flac"
+    if head[:4] == b"OggS":
+        return "ogg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "wav"
+    if head[4:8] == b"ftyp":
+        return "m4a"
+    if head[:4] == b"MAC ":
+        return "ape"
+    if head[:4] == b"wvpk":
+        return "wv"
+    return None
+
+
 def ext_from_content_type(content_type: str) -> str:
     ct = (content_type or "").lower()
     if "flac" in ct:
@@ -1500,7 +1523,7 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, track_info: di
             # 优先使用飞牛内置原生自定义音源执行引擎 (彻底不经过 9528)
             custom_res = await native_engine.resolve_music_url_native(
                 song_meta,
-                quality="flac",
+                quality="320k",
             )
             if custom_res and custom_res.get("url"):
                 res = {
@@ -1524,7 +1547,7 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, track_info: di
                             "name": kw_match["title"],
                             "singer": kw_match["artist"],
                         }
-                        custom_res = await native_engine.resolve_music_url_native(kw_meta, quality="flac")
+                        custom_res = await native_engine.resolve_music_url_native(kw_meta, quality="320k")
                         if custom_res and custom_res.get("url"):
                             res = {
                                 "url": custom_res["url"],
@@ -1541,7 +1564,7 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, track_info: di
             if not custom_res:
                 custom_res = await feats.resolve_url_by_custom_source(
                     song_meta,
-                    quality="flac",
+                    quality="320k",
                     lx_server_url=lx_server,
                 )
             if custom_res and custom_res.get("url"):
@@ -1763,7 +1786,7 @@ def merge_online_tracks(
 def extract_guid(request: Request, path_guid: str | None = None) -> str:
     if path_guid:
         return path_guid
-    return (
+    guid = (
         request.query_params.get("guid")
         or request.query_params.get("trackGUID")
         or request.query_params.get("trackGuid")
@@ -1772,6 +1795,16 @@ def extract_guid(request: Request, path_guid: str | None = None) -> str:
         or request.query_params.get("trackId")
         or ""
     )
+    if guid:
+        return guid
+    # Fallback: native player may encode the online guid in the URL path
+    # (e.g. /music/api/v1/track/stream/online/lx/online:lx:kw:1044318.flac)
+    subpath = request.path_params.get("subpath") or ""
+    if subpath:
+        m = re.search(r"(online:[^/]+?)(?:\.[a-zA-Z0-9]+)?$", subpath)
+        if m:
+            return m.group(1)
+    return ""
 
 
 async def extract_guid_from_body(request: Request) -> str:
@@ -2048,9 +2081,15 @@ async def search_track(request: Request):
     if size < 1:
         size = 50
 
+    # 飞牛更新后上游搜索参数由 keyword 改为 q：转发前把 keyword 翻译成 q（保留其余参数）
+    fwd_pairs = urllib.parse.parse_qsl(request.url.query, keep_blank_values=True)
+    if fwd_pairs and not any(k == "q" for k, _ in fwd_pairs) and any(k == "keyword" for k, _ in fwd_pairs):
+        fwd_pairs = [("q" if k == "keyword" else k, v) for k, v in fwd_pairs]
+    fwd_query = urllib.parse.urlencode(fwd_pairs)
+
     url_path = request.url.path
-    if request.url.query:
-        url_path = f"{url_path}?{request.url.query}"
+    if fwd_query:
+        url_path = f"{url_path}?{fwd_query}"
     headers = copy_incoming_headers(request)
 
     req = upstream_client.build_request("GET", url_path, headers=headers)
@@ -2363,6 +2402,69 @@ def _session_page(entry: dict, page: int, size: int) -> list[dict]:
 
 @app.get("/music/api/v1/search/suggest")
 @app.get("/music/api/v1/search/suggest/{subpath:path}")
+
+
+@app.get("/music/ext/api/track/alternatives")
+async def track_alternatives(request: Request):
+    """Return candidate sources for the currently playing online track.
+
+    The client can present these as a "change source" list. Each candidate
+    keeps its own GUID so stream requests stay byte-consistent.
+    """
+    guid = extract_guid(request)
+    if not is_online_guid(guid):
+        return JSONResponse(content={"code": 100002, "msg": "invalid online guid", "data": None}, status_code=400)
+
+    # Try to get metadata for the current guid
+    info = await _online_info(request, guid)
+    title = str((info or {}).get("title") or "").strip()
+    artist = str((info or {}).get("artist") or "").strip()
+    if not title:
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": {"items": []}})
+
+    keyword = f"{title} {artist}".strip() if artist else title
+    suggest = await feats.get_search_suggestions(keyword)
+    raw_items = suggest.get("candidates") or []
+
+    seen = set()
+    candidates = []
+    for it in raw_items:
+        if not isinstance(it, dict):
+            continue
+        cand_title = str(it.get("title") or it.get("name") or "").strip()
+        cand_artist = str(it.get("artist") or "").strip()
+        cand_guid = str(it.get("guid") or it.get("id") or "").strip()
+        if not cand_guid or cand_guid == guid:
+            continue
+        if not cand_guid.startswith("online:"):
+            continue
+        key = (cand_title.lower(), cand_artist.lower(), cand_guid)
+        if key in seen:
+            continue
+        seen.add(key)
+        src_part = source_from_online_guid(cand_guid)
+        candidates.append({
+            "guid": cand_guid,
+            "id": cand_guid,
+            "trackId": cand_guid,
+            "title": cand_title,
+            "artist": cand_artist,
+            "album": str(it.get("album") or "").strip(),
+            "source": str(it.get("badge") or src_part or "").strip(),
+            "duration_s": float(it.get("duration_s") or 0),
+            "ext": "mp3",
+            "cover_url": str(it.get("cover_url") or "").strip(),
+            "badge": str(it.get("badge") or "").strip(),
+        })
+
+    def rank_key(c):
+        title_match = (title.lower() in c["title"].lower()) or (c["title"].lower() in title.lower())
+        artist_match = bool(artist) and ((artist.lower() in c["artist"].lower()) or (c["artist"].lower() in artist.lower()))
+        return (-int(title_match), -int(artist_match), -c["duration_s"])
+
+    candidates.sort(key=rank_key)
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"items": candidates[:12], "current": {"guid": guid, "title": title, "artist": artist}}})
+
 @app.get("/music/ext/api/search/suggest")
 async def search_suggest(request: Request):
     """
@@ -2551,7 +2653,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 if not resolved:
                     return None
                 url = resolved["url"]
-                ext = resolved.get("ext")
+                ext = resolved.get("ext") or resolved.get("format")
                 for key, value in (resolved.get("headers") or {}).items():
                     if key.lower() in ("referer", "user-agent"):
                         headers[key] = str(value)
@@ -2584,6 +2686,10 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
         if not first:
             _RESOLVE_CACHE.pop(song_id_from_online_guid(guid), None)
             return None
+        # 真字节优先：自定义音源可能谎报 format（如返回 MP3 字节却声明 flac）
+        magic_ext = _ext_from_magic(first)
+        if magic_ext:
+            ext = magic_ext
         result = (resp, owned, ext, info, chunks, first)
         resp = owned = None  # transfer ownership to response iterator
         return result
@@ -3747,7 +3853,8 @@ async def playlist_list(request: Request):
             "name": "💖 我的心动歌曲",
             "desc": ai_cached.get("summary") or "AI 根据您的听歌偏好与常播歌曲，为您定制的心动推荐",
             "coverId": "ai:heartbeat:recommend",
-            "cover_url": "",
+            "coverUrl": "/music/api/v1/static/cover?coverId=ai:heartbeat:recommend",
+            "cover_url": "/music/api/v1/static/cover?coverId=ai:heartbeat:recommend",
             "trackCount": len(ai_tracks) if ai_tracks else 15,
             "isSystem": True,
             "createdAt": 1700000000,
@@ -3765,7 +3872,8 @@ async def playlist_list(request: Request):
             "name": "下载管理",
             "desc": f"在飞牛音乐中下载的音乐 · 共 {len(dl_records)} 首",
             "coverId": "local:downloads",
-            "cover_url": "",
+            "coverUrl": "/music/api/v1/static/cover?coverId=local:downloads",
+            "cover_url": "/music/api/v1/static/cover?coverId=local:downloads",
             "trackCount": len(dl_records),
             "isSystem": True,
             "createdAt": 1700000000,
@@ -3776,12 +3884,14 @@ async def playlist_list(request: Request):
         if cfg.get("enable_leaderboards", True):
             for b in cfg.get("boards", feats.DEFAULT_BOARDS):
                 if b.get("enabled"):
+                    _b_id = b["id"]
                     injected.append({
-                        "guid": b["id"],
+                        "guid": _b_id,
                         "name": b["name"],
                         "desc": f"落雪音源 · {b['name']}",
-                        "coverId": b["id"],
-                        "cover_url": "",
+                        "coverId": _b_id,
+                        "coverUrl": f"/music/api/v1/static/cover?coverId={_b_id}",
+                        "cover_url": f"/music/api/v1/static/cover?coverId={_b_id}",
                         "trackCount": b.get("count", 100),
                         "isSystem": True,
                         "createdAt": 1700000000,
@@ -3932,22 +4042,33 @@ async def playlist_detail(request: Request):
 
 @app.post("/music/api/v1/playlist/edit")
 async def playlist_edit(request: Request):
-    """处理歌单编辑（系统虚拟歌单、第三方导入歌单及官方本地歌单）"""
+    """处理歌单编辑（系统虚拟歌单、第三方导入歌单及官方本地歌单）
+    兼容飞牛「加入歌单」复用本接口的场景：body 可能带 tracks/trackGUIDs 等曲目字段。
+    """
     try:
         body = await request.json()
     except Exception:
         body = {}
+    if not isinstance(body, dict):
+        body = {}
     guid = str(body.get("guid") or "").strip()
     new_name = str(body.get("name") or "").strip()
+
+    # 解析待加入的曲目（飞牛「加入歌单」可能复用 edit 接口并携带曲目）
+    tracks_to_add = None
+    for key in ("tracks", "trackGUIDs", "trackGuids", "trackGuidsToAdd", "trackGUID"):
+        v = body.get(key)
+        if v:
+            tracks_to_add = v if isinstance(v, list) else [v]
+            break
 
     # 1. 导入的自定义歌单 (cplaylist:* / imported:*)
     if feats.is_custom_playlist_guid(guid):
         upstream_client = get_upstream_client(request.app)
         is_authed, user_guid, _ = await _probe_upstream_auth(request, upstream_client)
         user_key = user_guid if is_authed else "shared"
-        
+
         # 尝试更新用户目录下的歌单，若在 shared 下则更新 shared
-        updated = False
         for u in [user_key, "shared"]:
             pls = feats.load_user_custom_playlists(u)
             for pl in pls:
@@ -3956,17 +4077,45 @@ async def playlist_edit(request: Request):
                         pl["name"] = new_name
                     if "desc" in body:
                         pl["desc"] = body["desc"]
+                    # 真正写入曲目（修复：此前直接忽略 tracks，导致「加入歌单」静默失败）
+                    if tracks_to_add:
+                        exist = list(pl.get("tracks") or [])
+                        known = set()
+                        for t in exist:
+                            if isinstance(t, dict):
+                                g = t.get("guid") or t.get("id")
+                                if g:
+                                    known.add(str(g))
+                        for t in tracks_to_add:
+                            if isinstance(t, dict):
+                                tg = str(t.get("guid") or t.get("id") or t.get("trackGUID") or "")
+                                item = dict(t)
+                            else:
+                                tg = str(t)
+                                item = {"guid": tg, "id": tg}
+                            if not tg or tg in known:
+                                continue
+                            known.add(tg)
+                            exist.append(item)
+                        pl["tracks"] = exist
                     pl["updatedAt"] = int(time.time())
                     feats.save_user_custom_playlist(u, pl)
-                    updated = True
                     return JSONResponse(content={
                         "code": 0, "msg": "ok",
-                        "data": {"guid": guid, "name": pl.get("name"), "desc": pl.get("desc")}
+                        "data": {"guid": guid, "name": pl.get("name"), "desc": pl.get("desc"),
+                                 "trackCount": len(pl.get("tracks") or [])}
                     })
         return JSONResponse(content={"code": 0, "msg": "ok", "data": {"guid": guid, "name": new_name}})
 
-    # 2. 系统虚拟内置歌单 (如 local:downloads, board:*, online_pl:*)
-    if guid == "local:downloads" or feats.is_board_guid(guid) or feats.is_online_playlist_guid(guid) or dailyrec.is_daily_playlist_guid(guid):
+    # 2. 系统虚拟内置歌单 (如 local:downloads, board:*, online_pl:*, ai:heartbeat:recommend)
+    if (guid == "local:downloads" or feats.is_board_guid(guid) or feats.is_online_playlist_guid(guid)
+            or dailyrec.is_daily_playlist_guid(guid) or guid == "ai:heartbeat:recommend"):
+        # 动态生成的歌单无法落盘保存，明确提示而不是静默返回成功
+        if tracks_to_add:
+            return JSONResponse(content={
+                "code": -1,
+                "msg": "该歌单为系统动态生成，不支持添加歌曲（可先把歌曲「下载到NAS」再加入本地歌单）"
+            })
         return JSONResponse(content={"code": 0, "msg": "ok", "data": {"guid": guid, "name": new_name or "歌单"}})
 
     # 3. 官方原生本地歌单转发给上游
@@ -4593,7 +4742,7 @@ async def ext_api_download_song(request: Request):
 
         cfg = feats.load_settings()
         t_dir = cfg.get("download_dir") or detect_library_dir()
-        track_meta = {"title": title, "artist": artist} if title else None
+        track_meta = {"title": title, "artist": artist, "quality": "flac"} if title else None
         
         # 写入下载开始记录
         rec_id = download_mgr.record_download(guid=guid, title=title or "未知曲目", artist=artist, status="downloading")
@@ -4605,7 +4754,7 @@ async def ext_api_download_song(request: Request):
             download_mgr.update_download_status(
                 record_id=rec_id,
                 status="success",
-                ext="flac",
+                ext=res.get("ext") or "flac",
                 size_mb=res.get("size_mb") or 0,
                 file_path=res.get("path") or "",
             )
@@ -5290,6 +5439,164 @@ async def ext_api_lx_get_data(user: str = "admin"):
 app.include_router(download_routes.router)
 
 
+# ---------------------------------------------------------------------------
+# 运行时动态注入扩展前端（核心改造：不修改飞牛任何文件；飞牛更新只换 hash，
+# 本代理在转发 HTML 响应时重新注入独立脚本，基本免维护）
+# ---------------------------------------------------------------------------
+EXT_FRONTEND_DIR = Path(os.environ.get("FNMUSIC_EXT_FRONTEND_DIR",
+                                        "/vol1/1000/tools/fnmusic_ext/ext")).resolve()
+
+
+def _ext_frontend_inject(html: str) -> str:
+    """在 HTML 响应里注入独立扩展脚本/样式；幂等；并剥离旧版内联扩展脚本。"""
+    if "FN_MUSIC_EXT_RUNTIME" in html:
+        return html
+    # 剥离旧版寄生在 index.html 里的扩展 <script>（新前端已失效，仅留死代码/报错）。
+    # 关键：只删除「包含关键字的那个 <script>…</script> 块」，且不可跨越其它 </script>，
+    # 否则会从文档第一个 <script>（SPA 入口模块）一路吃到旧扩展脚本，误删入口 → 整页空白。
+    for _kw in ("fnPlayCandidate", "__FN_PLAYER_STORE__", "openSourceModal"):
+        html = re.sub(
+            r"<script[^>]*>(?:(?!</script>).)*?" + re.escape(_kw) + r".*?</script>",
+            "",
+            html,
+            flags=re.S,
+        )
+    tag = (
+        '<link rel="stylesheet" crossorigin href="/music/ext/static/ext.css">\n'
+        '<script defer src="/music/ext/static/ext.js"></script>\n'
+        "<!-- FN_MUSIC_EXT_RUNTIME -->\n"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", tag + "</head>", 1)
+    elif "</body>" in html:
+        html = html.replace("</body>", tag + "</body>", 1)
+    else:
+        html += tag
+    return html
+
+
+@app.get("/music/ext/static/{filename:path}")
+async def ext_frontend_static(filename: str):
+    target = (EXT_FRONTEND_DIR / filename).resolve()
+    if not str(target).startswith(str(EXT_FRONTEND_DIR)) or not target.is_file():
+        return Response(status_code=404)
+    suffix = target.suffix.lower()
+    ctype = {
+        ".js": "application/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".png": "image/png",
+        ".svg": "image/svg+xml",
+        ".json": "application/json; charset=utf-8",
+        ".map": "application/json; charset=utf-8",
+    }.get(suffix, "application/octet-stream")
+    return FileResponse(target, media_type=ctype, headers={"cache-control": "no-cache"})
+
+
+@app.post("/music/api/v1/playlist/{rest:path}")
+async def playlist_add_guard(request: Request, rest: str):
+    """兜底：飞牛「加入歌单」若走 track/add / add-track 等专用写入接口，
+    对扩展虚拟歌单自行处理（自定义歌单落盘写入，动态歌单明确提示），其余转发上游。
+    """
+    low = (rest or "").lower()
+    if "add" not in low and "collect" not in low:
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    p_guid = str(body.get("playlistGUID") or body.get("playlistGuid") or body.get("playlistId") or "").strip()
+    if not p_guid:
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    raw = None
+    for k in ("trackGUIDs", "trackGuids", "tracks", "guids", "trackGuid"):
+        v = body.get(k)
+        if v:
+            raw = v if isinstance(v, list) else [v]
+            break
+    if not raw:
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    if feats.is_custom_playlist_guid(p_guid):
+        upstream_client = get_upstream_client(request.app)
+        is_authed, user_guid, _ = await _probe_upstream_auth(request, upstream_client)
+        user_key = user_guid if is_authed else "shared"
+        for u in [user_key, "shared"]:
+            pls = feats.load_user_custom_playlists(u)
+            for pl in pls:
+                if pl.get("guid") == p_guid:
+                    exist = list(pl.get("tracks") or [])
+                    known = set()
+                    for t in exist:
+                        if isinstance(t, dict):
+                            g = t.get("guid") or t.get("id")
+                            if g:
+                                known.add(str(g))
+                    added = 0
+                    for t in raw:
+                        if isinstance(t, dict):
+                            tg = str(t.get("guid") or t.get("id") or t.get("trackGUID") or "")
+                            item = dict(t)
+                        else:
+                            tg = str(t)
+                            item = {"guid": tg, "id": tg}
+                        if not tg or tg in known:
+                            continue
+                        known.add(tg)
+                        exist.append(item)
+                        added += 1
+                    pl["tracks"] = exist
+                    pl["updatedAt"] = int(time.time())
+                    feats.save_user_custom_playlist(u, pl)
+                    return JSONResponse(content={"code": 0, "msg": "ok",
+                                                 "data": {"added": added, "guid": p_guid}})
+
+    if (p_guid == "local:downloads" or feats.is_board_guid(p_guid) or feats.is_online_playlist_guid(p_guid)
+            or dailyrec.is_daily_playlist_guid(p_guid) or p_guid == "ai:heartbeat:recommend"):
+        return JSONResponse(content={
+            "code": -1,
+            "msg": "该歌单为系统动态生成，不支持添加歌曲（可先把歌曲「下载到NAS」再加入本地歌单）"
+        })
+
+    return await forward_to_upstream(request, get_upstream_client(request.app))
+
+
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def catch_all(request: Request, full_path: str):
-    return await forward_to_upstream(request, get_upstream_client(request.app))
+    client = get_upstream_client(request.app)
+    if request.method == "GET":
+        url_path = request.url.path
+        if request.url.query:
+            url_path = f"{url_path}?{request.url.query}"
+        try:
+            resp = await client.send(
+                client.build_request("GET", url_path, headers=copy_incoming_headers(request)),
+                stream=True,
+            )
+        except Exception:
+            return await forward_to_upstream(request, client)
+        ctype = resp.headers.get("content-type", "")
+        if resp.status_code == 200 and "text/html" in ctype:
+            body = await resp.aread()
+            await resp.aclose()
+            html = body.decode("utf-8", "replace")
+            html = _ext_frontend_inject(html)
+            return HTMLResponse(
+                html,
+                status_code=200,
+                headers=filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"}),
+            )
+        # 非 HTML：按原样流式转发（不缓冲，避免破坏音频/二进制流）
+        async def _stream() -> AsyncGenerator[bytes, None]:
+            try:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await resp.aclose()
+        return StreamingResponse(
+            _stream(),
+            status_code=resp.status_code,
+            headers=filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"}),
+        )
+    return await forward_to_upstream(request, client)

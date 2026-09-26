@@ -3,6 +3,49 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [1.3.2] - 2026-09-26
+
+### 架构
+
+- **前端接入改为「独立脚本运行时动态注入」，不再修改飞牛任何文件**：`proxy/app.py` 在代理
+  `/music/` 的 HTML 响应时于内存中注入 `<link ext.css>` + `<script ext.js>`（托管于
+  `/music/ext/static/`，源码目录 `ext/`），并剥离新版前端中已失效的旧内联扩展脚本。
+  飞牛更新仅改变 `static/assets/` 文件名哈希，代理会自动重新注入，**后续升级基本免维护**。
+- `install.sh` 不再向飞牛官方目录写入 `static_patch`（旧架构）。若检测到历史安装残留的
+  `index.html.orig`，会自动还原官方前端文件。
+- 新增源码目录 `ext/`（`ext.js` / `ext.css`），随安装包一起部署。
+
+### 修复
+
+- **升级飞牛后音乐页整页白屏**：剥离旧内联扩展脚本的正则 `<script[^>]*>.*?<kw>.*?</script>`
+  （带 `re.S`）会从文档第一个 `<script>` 一路跨 `</script>` 吃到目标块，误删 SPA 入口模块与
+  `<div id="root">`（返回 HTML 由 ~82KB 缩水到 838 字节）。改为「不跨越 `</script>`」的安全
+  写法 `(?:(?!</script>).)*?`，只删包含关键字的那一个脚本块。
+- **换源 / 在线音乐点击后无法播放**：飞牛新前端移除了 `window.__FN_PLAYER_STORE__`，播放器
+  store 仅存在于 React 内部。现通过 **React fiber 树自省**获取，并修正三处实现缺陷：
+  1. React 18 `createRoot` 下 `__reactContainer$` 是 FiberRoot，需再解一层 `.current`；
+  2. 必须遍历 hook 链表（沿 `.next`），只查首个 hook 会漏掉非首位的 `useRef(store)`；
+  3. `addAndPlayTrack` **不在 store 实例上，而在 `getState()` 返回的 state 对象上**，
+     原判定条件恒为假。
+- **「下载到 NAS」按钮失效**：工具栏下载按钮现直接调 `POST /music/ext/api/song/download`
+  下载当前歌曲；右键/长按该按钮打开下载管理。
+- **部分歌单（酷我/抖音/欧美榜单、心动、下载管理）不显示封面**：注入的系统歌单此前只给
+  `cover_url`，飞牛侧边栏读 `coverUrl`。现两者同时提供，指向
+  `/music/api/v1/static/cover?coverId=<id>`。
+- **加入歌单失败**：`POST /playlist/edit` 此前只处理改名、完全忽略 body 中的曲目字段
+  （返回成功但歌未写入）；`ai:heartbeat:recommend` 未纳入虚拟歌单分支而被错误转发给原生后端。
+  现已支持 `tracks`/`trackGUIDs` 落盘写入自定义歌单，动态歌单返回明确提示，并新增
+  `POST /music/api/v1/playlist/{rest:path}` 通配兜底拦截加曲请求。
+- **在线搜索面板无结果**：飞牛更新后上游搜索参数由 `keyword=` 改为 `q=`，代理原样转发导致
+  `{code:100002,"invalid arguments"}`。现转发前自动把 `keyword` 翻译成 `q`（其余参数保留）。
+
+### 优化
+
+- **下载音质改为无损优先**：原逻辑逐源试 `flac→320k→128k`，任一源只要有有损档就立即下载，
+  不再尝试其它源的无损。现改为**跨源两轮收集**：第一轮遍历全部候选源收集无损直链，全源均
+  无无损才退回有损，落盘前仍做音频头魔数校验。
+- 下载记录 `ext` 字段不再硬编码 `flac`，改为写入真实格式（此前数据库显示 flac 实际是 mp3）。
+
 ## [1.3.1] - 2026-09-19
 
 ### 修复

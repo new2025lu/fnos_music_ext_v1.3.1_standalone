@@ -54,35 +54,18 @@ echo "[*] 正在同步/更新 Python 依赖库 (清华源镜像)..."
 "${TARGET_DIR}/.venv-proxy/bin/pip" install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple --quiet || true
 "${TARGET_DIR}/.venv-proxy/bin/pip" install -i https://pypi.tuna.tsinghua.edu.cn/simple -r "${TARGET_DIR}/proxy/requirements.txt"
 
-# 4. 注入前端定制补丁 (已内置硬编码中文字符串，杜绝 layout.sidebar 键名乱码)
-echo -e "\033[34m[*] 正在注入前端静态补丁到飞牛音乐系统...\033[0m"
-if [ -d "${DIR}/static_patch" ]; then
-    # 备份原始官方前端资源
-    [ ! -f "${STATIC_DIR}/index.html.orig" ] && cp "${STATIC_DIR}/index.html" "${STATIC_DIR}/index.html.orig" 2>/dev/null || true
-    
-    cp -f "${DIR}/static_patch/index.html" "${STATIC_DIR}/index.html"
-    cp -f "${DIR}/static_patch/"*.js "${STATIC_DIR}/assets/" 2>/dev/null || true
-    cp -f "${DIR}/static_patch/"*.png "${STATIC_DIR}/assets/" 2>/dev/null || true
-
-    # 若官方存在多语言 json，一并注入中文键名兜底
-    if [ -f "${STATIC_DIR}/locales/zh-CN/music.json" ]; then
-        python3 -c '
-import json
-p = "'"${STATIC_DIR}"'/locales/zh-CN/music.json"
-try:
-    with open(p, "r", encoding="utf-8") as f:
-        d = json.load(f)
-    if "sidebar" in d:
-        d["sidebar"]["admin"] = "后台管理"
-        d["sidebar"]["leaderboards"] = "在线排行榜"
-        d["sidebar"]["downloads"] = "下载"
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-except Exception:
-    pass
-' 2>/dev/null || true
-    fi
-    echo -e "\033[32m[✓] 前端静态补丁注入完成！\033[0m"
+# 4. 前端扩展：运行时动态注入（1.3.2 起不再修改飞牛任何官方文件）
+echo -e "\033[34m[*] 正在部署前端扩展（运行时动态注入，不修改飞牛官方文件）...\033[0m"
+# 若此前安装过旧版（曾把静态补丁写进飞牛官方目录），从备份恢复官方原文件
+if [ -f "${STATIC_DIR}/index.html.orig" ]; then
+    cp -f "${STATIC_DIR}/index.html.orig" "${STATIC_DIR}/index.html" 2>/dev/null || true
+    echo -e "\033[33m[!] 检测到旧版静态补丁，已从 index.html.orig 恢复飞牛官方前端\033[0m"
+fi
+# 扩展前端由代理在返回 /music/ HTML 时动态注入：/music/ext/static/ext.js、ext.css
+if [ -f "${TARGET_DIR}/ext/ext.js" ] && [ -f "${TARGET_DIR}/ext/ext.css" ]; then
+    echo -e "\033[32m[✓] 前端扩展资源就绪（代理运行时注入，飞牛更新后免维护）\033[0m"
+else
+    echo -e "\033[31m[!] 未找到 ext/ext.js 或 ext/ext.css，扩展工具栏将不可用\033[0m"
 fi
 
 # 5. 配置并注册 systemd 服务 (规范化 Socket Takeover 劫持流程)

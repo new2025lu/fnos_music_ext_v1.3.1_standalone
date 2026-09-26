@@ -56,8 +56,11 @@ fnos_music_ext/
 │   ├── d371538581ad9966b984819f9af416a8-SNgk48eL.js
 │   ├── heartbeat_cover.png
 │   └── downloads_cover.png
+├── ext/                        # 前端扩展（代理运行时动态注入，不修改飞牛文件）
+│   ├── ext.js                  # 扩展主脚本：浮动工具栏、换源、在线搜索、下载到NAS
+│   └── ext.css                 # 工具栏与弹层样式
 ├── proxy/                      # 核心代理服务端
-│   ├── app.py                  # 代理网关路由、音频取流、元数据与封面分发
+│   ├── app.py                  # 代理网关路由、音频取流、元数据与封面分发、前端运行时注入
 │   ├── features.py             # 在线歌单、排行榜、后台管理控制面板
 │   ├── native_engine.py        # 原生 Node 沙箱解析引擎
 │   ├── source_runner.js        # Node 运行器

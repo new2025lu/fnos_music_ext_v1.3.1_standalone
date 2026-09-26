@@ -76,6 +76,7 @@ def _encrypted_audio_url(url: str) -> bool:
 _HOME = os.environ.get("HOME") or "/root"
 STATE_DIR = os.path.join(_HOME, ".local", "state", "fnmusic_ext")
 BOARD_CACHE_DIR = os.path.join(STATE_DIR, "board_cache")
+os.makedirs(BOARD_CACHE_DIR, exist_ok=True)
 PLAYLISTS_DIR = os.path.join(STATE_DIR, "custom_playlists")
 DOWNLOADS_DIR = os.path.join(STATE_DIR, "downloads")
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
@@ -714,8 +715,11 @@ async def download_online_song(
                     except Exception as e_kw:
                         logger.debug("search kuwo candidate failed: %s", e_kw)
 
+                # 无损优先（跨源两轮）：先收齐各源的无损直链，全源无无损才退回有损
                 candidate_urls = []
                 encrypted_urls = []
+                lossless_picks = []   # [(url, ext)]
+                lossy_picks = []      # [(url, ext)]
                 for song_meta in candidate_metas:
                     for q_try in [target_q, "flac", "320k", "128k"]:
                         nat_res = await native_engine.resolve_music_url_native(song_meta, quality=q_try)
@@ -728,15 +732,28 @@ async def download_online_song(
                                         encrypted_urls.append(u_test)
                                     logger.info("跳过加密音频流(无法直接播放): %s", u_test[:130])
                                     continue
-                                if u_test not in candidate_urls:
-                                    candidate_urls.append(u_test)
-                                if not stream_url:
-                                    stream_url = u_test
-                                    ext = nat_res.get("format") or ("flac" if "flac" in u_test else "mp3")
-                                    logger.info("download_online_song native_engine matched: %s via %s (id=%s, q=%s)", title, nat_res.get("sourceName"), song_meta.get("id"), q_try)
-                                    break
-                    if stream_url:
+                                _fmt = str(nat_res.get("format") or "").lower()
+                                _lossless = _fmt in ("flac", "wav", "ape", "wv", "aiff", "dsf") \
+                                    or ".flac" in u_test.lower() or ".wav" in u_test.lower() \
+                                    or ".ape" in u_test.lower() or q_try in ("flac", "wav", "ape")
+                                if _lossless:
+                                    if all(u_test != p[0] for p in lossless_picks):
+                                        lossless_picks.append((u_test, _fmt or "flac"))
+                                        logger.info("命中无损直链: %s via %s (id=%s, q=%s)", title, nat_res.get("sourceName"), song_meta.get("id"), q_try)
+                                    break  # 该源已拿到无损，无需再试有损档位
+                                if all(u_test != p[0] for p in lossy_picks):
+                                    lossy_picks.append((u_test, _fmt or "mp3"))
+                    # 已收齐足够无损备选，提前结束
+                    if len(lossless_picks) >= 2:
                         break
+                if lossless_picks:
+                    stream_url, ext = lossless_picks[0]
+                    candidate_urls = [p[0] for p in lossless_picks[1:]] + [p[0] for p in lossy_picks]
+                    logger.info("download_online_song 选用无损源: %s (%s)", title, ext)
+                elif lossy_picks:
+                    stream_url, ext = lossy_picks[0]
+                    candidate_urls = [p[0] for p in lossy_picks[1:]]
+                    logger.info("所有候选源均无可用无损，退回有损: %s (%s)", title, ext)
                 if not stream_url and encrypted_urls:
                     candidate_urls.extend(encrypted_urls)
                     logger.warning("全部候选源均为加密音频流，无明文可播直链: %s", title)
@@ -1006,6 +1023,7 @@ async def download_online_song(
                 "ok": True,
                 "msg": f"成功下载《{title} - {artist}》({ext.upper()}, {file_size_mb}MB)",
                 "path": file_path,
+                "ext": ext,
                 "size_mb": file_size_mb,
             }
         except Exception as e:
@@ -3654,6 +3672,7 @@ def render_console_html(stats: dict, settings: dict, playlists: list, favorites_
 # ==========================================
 ONLINE_PL_CACHE_DIR = os.path.join(STATE_DIR, "online_pl_cache")
 os.makedirs(ONLINE_PL_CACHE_DIR, exist_ok=True)
+os.makedirs(ONLINE_PL_CACHE_DIR, exist_ok=True)
 
 def is_online_playlist_guid(guid: str | None) -> bool:
     if not guid:
@@ -3698,6 +3717,7 @@ async def fetch_online_playlists_list(source: str = "wy", page: int = 1, tag_id:
                             "id": pid,
                             "source": "wy",
                             "name": str(it.get("name") or "").strip(),
+                            "title": str(it.get("name") or "").strip(),
                             "author": str((it.get("creator") or {}).get("nickname") or "网易云精选").strip(),
                             "play_count": str(it.get("playCount") or ""),
                             "total": it.get("trackCount") or 0,
@@ -3718,6 +3738,7 @@ async def fetch_online_playlists_list(source: str = "wy", page: int = 1, tag_id:
                             "id": pid,
                             "source": "kw",
                             "name": str(it.get("name") or "").strip(),
+                            "title": str(it.get("name") or "").strip(),
                             "author": str(it.get("uname") or "酷我精选").strip(),
                             "play_count": str(it.get("listencnt") or ""),
                             "total": it.get("total") or 0,
